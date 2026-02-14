@@ -1,0 +1,19 @@
+# Vinted API wrappers
+vinted_scraper>=2.4.0
+vinted-api-wrapper>=0.3.9
+
+# HTTP client with TLS fingerprint impersonation
+curl_cffi>=0.5.0
+
+# LangChain and LangGraph for multi-agent workflows
+langgraph>=0.0.40
+langchain-google-genai>=1.0.0
+
+# Google Generative AI SDK
+google-generativeai>=0.3.0
+
+# Environment management
+python-dotenv>=1.0.0
+
+# MCP (Model Context Protocol)
+mcp>=0.1.0
