@@ -81,15 +81,32 @@ A mobile-first Progressive Web App (PWA) that converts natural-language goals in
 | `user_id` | UUID | -- | FK -> `users.id` |
 | `title` | TEXT | -- | e.g., "LeetCode Mastery" |
 | `prompt_used` | TEXT | -- | Original user prompt, stored for re-generation |
-| `total_sessions` | INTEGER | -- | Count of sessions generated |
+| `duration_description` | TEXT | -- | e.g., "3 months" -- used when generating monthly breakdowns |
+| `total_months` | INTEGER | -- | Total number of months in the plan |
+| `months_planned` | INTEGER | `0` | How many months have been broken down into sessions so far |
 | `created_at` | TIMESTAMPTZ | `now()` | Auto |
 
-### 4.3 `sessions` Table
+### 4.3 `milestones` Table (High-Level Monthly Plan)
+
+| Column | Type | Default | Notes |
+|---|---|---|---|
+| `id` | UUID | `gen_random_uuid()` | Primary key |
+| `plan_id` | UUID | -- | FK -> `plans.id` ON DELETE CASCADE |
+| `user_id` | UUID | -- | FK -> `users.id` (denormalized for RLS) |
+| `month_number` | INTEGER | -- | 1, 2, 3... (sequential month within the plan) |
+| `title` | TEXT | -- | e.g., "Foundation: Arrays & Strings" |
+| `description` | TEXT | -- | e.g., "Build comfort with basic data structures and common patterns" |
+| `weekly_themes` | JSONB | -- | Array of 4 weekly theme strings, e.g., `["Arrays basics", "String manipulation", "Hash maps", "Review & practice"]` |
+| `is_planned` | BOOLEAN | `false` | True once daily sessions have been generated for this month |
+| `created_at` | TIMESTAMPTZ | `now()` | Auto |
+
+### 4.4 `sessions` Table
 
 | Column | Type | Default | Notes |
 |---|---|---|---|
 | `id` | UUID | `gen_random_uuid()` | Primary key |
 | `plan_id` | UUID | -- | FK -> `plans.id` |
+| `milestone_id` | UUID | -- | FK -> `milestones.id` (which month this session belongs to) |
 | `user_id` | UUID | -- | FK -> `users.id` (denormalized for RLS) |
 | `scheduled_time` | TIMESTAMPTZ | -- | When the session is scheduled |
 | `duration_minutes` | INTEGER | `30` | Length of session |
@@ -99,7 +116,7 @@ A mobile-first Progressive Web App (PWA) that converts natural-language goals in
 | `original_time` | TIMESTAMPTZ | -- | Stores pre-reshuffle time for history |
 | `created_at` | TIMESTAMPTZ | `now()` | Auto |
 
-### 4.4 Row-Level Security
+### 4.5 Row-Level Security
 
 All tables must have RLS enabled. Policy: users can only read/write their own rows (`auth.uid() = user_id`).
 
@@ -107,18 +124,38 @@ All tables must have RLS enabled. Policy: users can only read/write their own ro
 
 ## 5. Core User Flows
 
-### Flow A: Plan Generation and Calendar Insertion
+### Flow A: Plan Generation (Two-Tier Architecture)
+
+Plan generation is split into two stages to handle long durations reliably:
+
+**Stage 1: High-Level Plan (runs once when user creates a plan)**
 
 ```
 User opens "AI Planner" page
   -> Types goal: "I want to do LeetCode for 30 mins every day at 5 PM except Sundays for 3 months"
-  -> App sends prompt to OpenAI with system instructions (see Section 7)
-  -> AI returns JSON array of sessions with dates, topics, and MVRs
-  -> App renders a preview: horizontal scrolling week cards + sample topics
-  -> User taps "Looks Good, Add to Calendar"
-  -> App batch-inserts sessions into Supabase `sessions` table
-  -> User is redirected to Dashboard showing today's sessions
+  -> App calls LLM with the "High-Level Planner" prompt (see Section 7.2)
+  -> AI returns a plan title + array of monthly milestones (title, description, weekly themes)
+  -> App renders a preview: month cards with themes, not individual sessions
+  -> User taps "Looks Good, Lock In Plan"
+  -> App inserts the plan + milestones into Supabase
+  -> App automatically triggers Stage 2 for Month 1
 ```
+
+**Stage 2: Monthly Breakdown (runs per month, on demand)**
+
+```
+App calls LLM with the "Monthly Breakdown" prompt (see Section 7.3)
+  -> Sends: original goal, this month's milestone info, weekly themes, schedule preferences
+  -> AI returns JSON array of daily sessions (date, time, topic, MVR) for that month only
+  -> App batch-inserts sessions into Supabase `sessions` table
+  -> Milestone is marked as is_planned = true, plan.months_planned increments
+  -> User sees this month's sessions on their Dashboard timeline
+```
+
+**When does Stage 2 run?**
+- Automatically for Month 1 right after plan creation
+- For subsequent months: user taps "Plan Next Month" button on the Plan Detail page
+- The button appears when the current month's sessions are >75% completed or the calendar month is ending
 
 ### Flow B: Daily Execution (Dashboard)
 
@@ -210,13 +247,14 @@ After 6 PM (configurable), if any sessions have status = 'pending':
    - Placeholder: "Describe your goal and schedule..."
    - Send button: teal circle with arrow icon
 
-3. **Plan Preview Component** (rendered as an AI response bubble)
+3. **Plan Preview Component** (rendered as an AI response bubble after Stage 1 LLM call)
    - Title: Generated plan name
-   - Horizontal scrollable week chips: "Week 1", "Week 2", etc.
-   - Sample session cards (first 3-5 topics)
-   - Session count badge: "42 sessions over 3 months"
+   - Horizontal scrollable **month cards** (not weeks): "Month 1: Foundation", "Month 2: Intermediate", etc.
+   - Each month card shows: title + description + 4 weekly theme bullets
+   - Duration badge: "3-month plan"
    - Large CTA button: `bg-teal-500 text-white rounded-2xl py-4 w-full font-bold`
-   - Text: "Looks Good, Add to Calendar"
+   - Text: "Looks Good, Lock In Plan"
+   - After tapping: Stage 2 auto-runs for Month 1, then redirects to Dashboard
 
 ### Screen 3: Plans Library
 
@@ -226,10 +264,32 @@ After 6 PM (configurable), if any sessions have status = 'pending':
 
 1. **Header:** "Your Plans"
 2. **Plan cards** (list)
-   - Plan title + session count + date created
-   - Progress indicator (completed / total sessions)
-   - Tap to see full session list for that plan
+   - Plan title + months planned vs. total months + date created
+   - Progress indicator (completed sessions / total generated sessions)
+   - Tap to see Plan Detail view
 3. **Empty state:** Friendly illustration + "Create your first plan" CTA linking to `/planner`
+
+### Screen 3b: Plan Detail View
+
+**Route:** `/plans/:id`
+
+**Layout:**
+
+1. **Plan header:** Title, original prompt, overall progress
+2. **Milestone timeline** (vertical list of monthly milestones):
+   - Each milestone card shows: month title, description, weekly themes
+   - Status badge:
+     - `is_planned = true`: "Active" (teal) -- sessions exist, shows session count + completion rate
+     - `is_planned = false` and it's the next month: shows **"Plan Next Month"** button (teal CTA)
+     - `is_planned = false` and it's a future month: "Upcoming" (grey)
+3. **"Plan Next Month" button:**
+   - Triggers Stage 2 LLM call for the next unplanned milestone
+   - Shows a loading state: "Generating your sessions..."
+   - On success: milestone flips to Active, sessions appear on Dashboard
+   - Appears when: the current month's sessions are >75% done OR the calendar date has entered the next month
+4. **Session list** (below milestones, filterable by month):
+   - Compact Routine Cards showing date, topic, status
+   - Grouped by week
 
 ### Screen 4: Life Happened Bottom Sheet
 
@@ -264,7 +324,7 @@ After 6 PM (configurable), if any sessions have status = 'pending':
 
 ---
 
-## 7. LLM Integration Specification
+## 7. LLM Integration Specification (Two-Tier Architecture)
 
 ### 7.1 API Configuration
 
@@ -273,13 +333,60 @@ After 6 PM (configurable), if any sessions have status = 'pending':
 - **Response format:** JSON mode enabled via `responseMimeType: "application/json"` in generation config
 - **API key:** Stored as Supabase Edge Function secret named `GEMINI_API_KEY` (never exposed client-side)
 
-### 7.2 System Prompt
+### 7.2 Prompt 1: High-Level Planner (Stage 1)
+
+Called once when the user creates a new plan. Generates the big picture -- monthly milestones and weekly themes -- but NOT individual daily sessions.
 
 ```
-You are an expert habit coach and schedule planner. The user will describe a goal, preferred schedule, and duration. You must return a JSON object with the following structure:
+You are an expert habit coach and long-term learning planner. The user will describe a goal, preferred schedule, and duration.
+
+You must return a JSON object with this structure:
 
 {
   "plan_title": "A short, motivating name for this plan",
+  "total_months": 3,
+  "milestones": [
+    {
+      "month_number": 1,
+      "title": "A concise name for this month's focus (e.g., 'Foundation: Arrays & Strings')",
+      "description": "A 1-2 sentence summary of what the user will achieve this month",
+      "weekly_themes": [
+        "Week 1 theme (e.g., 'Array fundamentals: traversal, insertion, deletion')",
+        "Week 2 theme",
+        "Week 3 theme",
+        "Week 4 theme"
+      ]
+    }
+  ]
+}
+
+Rules:
+- Create one milestone per month for the ENTIRE duration
+- Each month should build progressively on the previous one
+- Weekly themes within each month should have a logical learning arc
+- Make milestone titles motivating and specific (not generic like "Month 1")
+- The final month should include consolidation/review
+- Respect the user's stated skill level if mentioned
+```
+
+### 7.3 Prompt 2: Monthly Breakdown (Stage 2)
+
+Called once per month, when the user taps "Plan Next Month" or automatically for Month 1. Generates the actual daily sessions for a single month.
+
+```
+You are an expert habit coach. You are generating the DAILY SESSION BREAKDOWN for one specific month of a longer plan.
+
+Context:
+- User's original goal: [insert original prompt]
+- Schedule: [extracted schedule, e.g., "30 mins daily at 5 PM except Sundays"]
+- This is Month [N] of [total]: "[milestone title]"
+- Month description: "[milestone description]"
+- Weekly themes: [weekly_themes array]
+- Start date for this month: [YYYY-MM-DD]
+
+Return a JSON object with this structure:
+
+{
   "sessions": [
     {
       "date": "YYYY-MM-DD",
@@ -292,25 +399,29 @@ You are an expert habit coach and schedule planner. The user will describe a goa
 }
 
 Rules:
-- Generate sessions for the ENTIRE duration the user specifies
-- Make topics progressive (build difficulty/complexity over time)
+- Generate sessions ONLY for the dates within this month
+- Follow the weekly themes provided -- each week's sessions should match its theme
+- Make topics progressive WITHIN the month (easier -> harder)
 - Each MVR must be genuinely achievable in under 5 minutes
-- Respect any day exclusions the user mentions (e.g., "except Sundays")
-- Vary topics to prevent monotony
-- Group related topics into logical weekly themes when appropriate
+- Respect day exclusions from the schedule
+- Vary topics to prevent monotony, even within the same weekly theme
 ```
 
-### 7.3 Architecture
+### 7.4 Architecture
 
-The LLM call must happen server-side (Supabase Edge Function) to protect the API key:
+Both LLM calls happen server-side (Supabase Edge Functions) to protect the API key:
 
 ```
-Client (React) -> Supabase Edge Function -> Gemini API -> Parse JSON -> Insert into sessions table -> Return confirmation to client
+STAGE 1 (Plan Creation):
+Client -> Edge Function "generate-plan" -> Gemini API -> Parse JSON -> Insert plan + milestones -> Return preview to client
+
+STAGE 2 (Monthly Breakdown):
+Client -> Edge Function "generate-month" -> Gemini API -> Parse JSON -> Insert sessions + mark milestone as planned -> Return confirmation to client
 ```
 
-### 7.4 Gemini API Call Format
+### 7.5 Gemini API Call Format
 
-The Edge Function calls the Gemini REST API directly (no SDK needed in Deno):
+Both Edge Functions call the Gemini REST API directly (no SDK needed in Deno):
 
 ```
 POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro:generateContent?key=GEMINI_API_KEY
@@ -318,7 +429,7 @@ POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro:gene
 Body:
 {
   "contents": [
-    { "role": "user", "parts": [{ "text": "<system prompt + user goal>" }] }
+    { "role": "user", "parts": [{ "text": "<prompt with context>" }] }
   ],
   "generationConfig": {
     "responseMimeType": "application/json",
@@ -327,7 +438,7 @@ Body:
 }
 ```
 
-The response JSON is at `response.candidates[0].content.parts[0].text` -- parse that string as JSON to get the plan object.
+The response JSON is at `response.candidates[0].content.parts[0].text` -- parse that string as JSON to get the result object.
 
 ---
 
@@ -389,8 +500,9 @@ Where supported (`navigator.vibrate`), trigger a light 50ms vibration on:
 - [x] Dashboard with timeline and Routine Cards
 - [x] Complete and Life Happened flows
 - [x] Bottom Sheet with 3 reshuffle options
-- [x] AI Planner chat with plan preview
-- [x] Supabase backend with 3 tables
+- [x] AI Planner chat with high-level plan preview (Stage 1)
+- [x] Monthly breakdown generation with "Plan Next Month" (Stage 2)
+- [x] Supabase backend with 4 tables (profiles, plans, milestones, sessions)
 - [x] Resilience Score display and point logic
 - [x] Salvage the Day FAB
 - [x] Basic auth (Supabase email/password or magic link)

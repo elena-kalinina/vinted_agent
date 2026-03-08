@@ -110,12 +110,26 @@ TABLE: plans
 - user_id: UUID, not null, references profiles(id)
 - title: TEXT, not null
 - prompt_used: TEXT, not null
-- total_sessions: INTEGER, default 0
+- duration_description: TEXT, not null (e.g., "3 months")
+- total_months: INTEGER, not null
+- months_planned: INTEGER, default 0
+- created_at: TIMESTAMPTZ, default now()
+
+TABLE: milestones (high-level monthly plan)
+- id: UUID, primary key, default gen_random_uuid()
+- plan_id: UUID, not null, references plans(id) on delete cascade
+- user_id: UUID, not null, references profiles(id)
+- month_number: INTEGER, not null
+- title: TEXT, not null (e.g., "Foundation: Arrays & Strings")
+- description: TEXT, not null
+- weekly_themes: JSONB, not null (array of 4 strings)
+- is_planned: BOOLEAN, default false
 - created_at: TIMESTAMPTZ, default now()
 
 TABLE: sessions
 - id: UUID, primary key, default gen_random_uuid()
 - plan_id: UUID, not null, references plans(id) on delete cascade
+- milestone_id: UUID, not null, references milestones(id) on delete cascade
 - user_id: UUID, not null, references profiles(id)
 - scheduled_time: TIMESTAMPTZ, not null
 - duration_minutes: INTEGER, default 30
@@ -128,6 +142,7 @@ TABLE: sessions
 Enable Row Level Security on ALL tables. Policies:
 - profiles: Users can read and update only their own row (where id = auth.uid())
 - plans: Users can CRUD only their own rows (where user_id = auth.uid())
+- milestones: Users can CRUD only their own rows (where user_id = auth.uid())
 - sessions: Users can CRUD only their own rows (where user_id = auth.uid())
 
 Also create a database trigger: when a new user signs up (insert into auth.users), automatically create a row in the profiles table with their id and resilience_score = 0.
@@ -260,11 +275,11 @@ When tapped:
 
 ---
 
-## Step 6: AI Planner
+## Step 6: AI Planner (Two-Tier Generation)
 
-**Goal:** Build the AI-powered plan generation page.
+**Goal:** Build the AI-powered plan generation. Stage 1 generates a high-level monthly plan. Stage 2 generates daily sessions for one month at a time.
 
-### Prompt 6.1 -- Planner Chat UI
+### Prompt 6.1 -- Planner Chat UI (Stage 1: High-Level Plan)
 
 ```
 Create the AI Planner page at route "/planner" (accessible from the bottom nav "Planner" tab).
@@ -284,87 +299,146 @@ Layout -- make it look like a chat interface (similar to ChatGPT or iMessage):
 When the user types a message and hits send:
 - Show their message as a right-aligned bubble (bg-teal-500 text-white rounded-2xl)
 - Show a typing indicator (three animated dots in an AI bubble)
-- Call a Supabase Edge Function that:
-  a. Receives the user's prompt
-  b. Sends it to the Google Gemini API (model: gemini-3.1-pro) with this prompt:
+- Call a Supabase Edge Function "generate-plan" that sends the user's prompt to Gemini with this system prompt:
 
-PROMPT (sent as the user message, since Gemini doesn't have a separate system role in the REST API):
-"You are an expert habit coach and schedule planner. The user will describe a goal, preferred schedule, and duration. Return a JSON object with this structure:
+PROMPT:
+"You are an expert habit coach and long-term learning planner. The user will describe a goal, preferred schedule, and duration. Return a JSON object with this structure:
 {
   \"plan_title\": \"A short motivating name\",
+  \"total_months\": 3,
+  \"milestones\": [
+    {
+      \"month_number\": 1,
+      \"title\": \"A concise name for this month's focus (e.g., 'Foundation: Arrays & Strings')\",
+      \"description\": \"1-2 sentence summary of what the user will achieve this month\",
+      \"weekly_themes\": [
+        \"Week 1 theme (e.g., 'Array fundamentals: traversal, insertion, deletion')\",
+        \"Week 2 theme\",
+        \"Week 3 theme\",
+        \"Week 4 theme\"
+      ]
+    }
+  ]
+}
+Rules: Create one milestone per month for the ENTIRE duration. Each month builds progressively. Weekly themes should have a logical learning arc. Make titles motivating and specific. The final month should include consolidation/review.
+
+USER GOAL: [insert user prompt here]"
+
+  - Call Gemini with generationConfig: { responseMimeType: "application/json", temperature: 0.7 }
+  - Parse the response from response.candidates[0].content.parts[0].text
+
+After receiving the AI response, render it as a PLAN PREVIEW COMPONENT (not raw text):
+- Plan title in text-xl font-bold
+- A horizontal scrollable row of MONTH cards (not weeks):
+  - Each month card (bg-white rounded-2xl shadow-sm p-4 w-64 flex-shrink-0):
+    - "Month 1" label in text-xs text-slate-400
+    - Milestone title in font-bold text-slate-800 (e.g., "Foundation: Arrays & Strings")
+    - Description in text-sm text-slate-500
+    - 4 weekly theme bullets in text-xs text-slate-400
+- A duration badge: "3-month plan" in a teal pill
+- A large CTA button: bg-teal-500 text-white rounded-2xl py-4 w-full font-bold text-lg
+  Text: "Looks Good, Lock In Plan"
+
+When "Looks Good, Lock In Plan" is clicked:
+1. Create a new row in the plans table (title, prompt_used, duration_description, total_months, months_planned=0)
+2. Batch insert all milestones into the milestones table (linked to the plan, is_planned=false)
+3. AUTOMATICALLY trigger Stage 2 (Prompt 6.2 logic) for Month 1's milestone
+4. After Month 1 sessions are generated, show success: "Plan locked in! Month 1 is ready on your timeline."
+5. Navigate to the Dashboard "/"
+```
+
+### Prompt 6.2 -- Monthly Breakdown (Stage 2: Generate Sessions for One Month)
+
+```
+Create a reusable function (and a Supabase Edge Function called "generate-month") that generates daily sessions for a single month of a plan.
+
+This function receives:
+- The plan's original prompt (from plans.prompt_used)
+- The milestone to break down (its title, description, weekly_themes, month_number)
+- The plan's schedule preferences (extracted from the original prompt: time, duration, excluded days)
+- The start date for this month
+
+It calls Gemini with this prompt:
+
+PROMPT:
+"You are an expert habit coach. Generate the DAILY SESSION BREAKDOWN for one specific month of a longer plan.
+
+Context:
+- User's original goal: [plan.prompt_used]
+- Schedule: [extracted schedule, e.g., '30 mins daily at 5 PM except Sundays']
+- This is Month [milestone.month_number] of [plan.total_months]: '[milestone.title]'
+- Month description: '[milestone.description]'
+- Weekly themes: [milestone.weekly_themes as JSON array]
+- Start date: [YYYY-MM-DD]
+
+Return a JSON object:
+{
   \"sessions\": [
     {
       \"date\": \"YYYY-MM-DD\",
       \"time\": \"HH:MM\",
       \"duration_minutes\": 30,
-      \"topic\": \"Specific progressive topic. Be concrete -- not 'Practice guitar' but 'Learn Am and Em chord transitions'\",
-      \"mvr\": \"A minimum viable version achievable in under 5 minutes -- e.g., 'Strum each chord 10 times'\"
+      \"topic\": \"Specific progressive topic. Be concrete.\",
+      \"mvr\": \"Minimum viable version in under 5 minutes.\"
     }
   ]
 }
-Rules: Generate sessions for the FULL duration. Make topics progressive. Each MVR must be genuinely doable in under 5 minutes. Respect day exclusions. Vary topics to prevent monotony.
+Rules: Generate sessions ONLY for this month's dates. Follow the weekly themes. Make topics progressive within the month. Each MVR must be achievable in under 5 minutes. Respect day exclusions. Vary topics within the same theme."
 
-USER GOAL: [insert user prompt here]"
+  - Call Gemini with generationConfig: { responseMimeType: "application/json", temperature: 0.7 }
+  - Parse the response
 
-  c. The Gemini API must be called with generationConfig: { responseMimeType: "application/json", temperature: 0.7 } to enforce JSON output
-  d. Parse the response from response.candidates[0].content.parts[0].text
-  e. Returns the parsed JSON plan to the client
+After receiving sessions:
+1. Batch insert all sessions into the sessions table (linked to plan_id and milestone_id)
+2. Set the milestone's is_planned = true
+3. Increment plans.months_planned by 1
+4. Return success to the client
 
-After receiving the AI response, render it as a PLAN PREVIEW COMPONENT (not raw text):
-- Plan title in text-xl font-bold
-- A horizontal scrollable row of week chips: "Week 1", "Week 2", etc. (bg-slate-100 rounded-xl px-3 py-1)
-- Below that, show the first 5 session cards as a preview:
-  - Each shows: date, topic, and MVR in a compact card format
-- A count badge: "42 sessions over 3 months" (or whatever the actual count is)
-- A large CTA button: bg-teal-500 text-white rounded-2xl py-4 w-full font-bold text-lg
-  Text: "Looks Good, Add to Calendar"
-
-When "Looks Good, Add to Calendar" is clicked:
-1. Create a new row in the plans table with the title and original prompt
-2. Batch insert all sessions into the sessions table linked to that plan
-3. Show a success message: "Plan added! Check your timeline."
-4. Navigate to the Dashboard "/"
+This function will be called:
+- Automatically for Month 1 after plan creation (in the "Lock In Plan" flow)
+- On demand via the "Plan Next Month" button on the Plan Detail page (built in Step 7)
 ```
 
-### Prompt 6.2 -- Edge Function
+### Prompt 6.3 -- Edge Functions
 
 ```
-Create a Supabase Edge Function called "generate-plan" that:
+Create TWO Supabase Edge Functions:
 
-1. Accepts a POST request with JSON body: { "prompt": "user's goal description" }
-2. Validates the user is authenticated (check the Authorization header JWT)
-3. Calls the Google Gemini API using a direct REST call (no SDK needed in Deno):
-
+FUNCTION 1: "generate-plan" (Stage 1 - High Level)
+1. Accepts POST with JSON body: { "prompt": "user's goal description" }
+2. Validates authentication (Authorization header JWT)
+3. Calls Gemini REST API:
    URL: https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro:generateContent?key=${GEMINI_API_KEY}
    Method: POST
    Headers: { "Content-Type": "application/json" }
    Body: {
-     "contents": [
-       {
-         "role": "user",
-         "parts": [{ "text": "<system prompt instructions> + USER GOAL: <user's prompt>" }]
-       }
-     ],
-     "generationConfig": {
-       "responseMimeType": "application/json",
-       "temperature": 0.7
-     }
+     "contents": [{ "role": "user", "parts": [{ "text": "<Stage 1 prompt with user goal>" }] }],
+     "generationConfig": { "responseMimeType": "application/json", "temperature": 0.7 }
    }
+4. Extracts JSON from: response.candidates[0].content.parts[0].text
+5. Returns parsed plan object (title, total_months, milestones array)
 
-4. Extracts the JSON string from: response.candidates[0].content.parts[0].text
-5. Parses that string as JSON and returns the plan object to the client
+FUNCTION 2: "generate-month" (Stage 2 - Monthly Breakdown)
+1. Accepts POST with JSON body: { "plan_id": "uuid", "milestone_id": "uuid" }
+2. Validates authentication
+3. Fetches the plan (prompt_used) and milestone (title, description, weekly_themes) from Supabase
+4. Calculates the start date for this month based on month_number and plan creation date
+5. Calls Gemini REST API with the Stage 2 prompt (same URL and config as above, different prompt text)
+6. Parses the sessions array from the response
+7. Batch inserts sessions into the sessions table
+8. Updates milestone.is_planned = true and increments plan.months_planned
+9. Returns success with session count
 
-Store the Gemini API key as a Supabase secret named GEMINI_API_KEY (not in client code).
-Handle errors gracefully -- if Gemini returns malformed JSON, retry once, then return a friendly error message.
+Both functions: Store Gemini API key as Supabase secret GEMINI_API_KEY. Handle errors gracefully -- retry once on malformed JSON.
 ```
 
 ---
 
-## Step 7: Plans Library
+## Step 7: Plans Library and "Plan Next Month"
 
-**Goal:** Let users view and manage their plans.
+**Goal:** Let users view plans, see monthly milestones, and generate the next month's sessions on demand.
 
-### Prompt 7.1 -- Plans Page
+### Prompt 7.1 -- Plans List Page
 
 ```
 Create a Plans page at route "/plans" (accessible from bottom nav "Plans" tab).
@@ -377,15 +451,59 @@ Layout:
    - Each card (bg-white rounded-2xl shadow-sm p-4):
      - Plan title in font-bold text-slate-800
      - Created date in text-sm text-slate-400
-     - Progress bar showing (completed + completed_mvr sessions) / total sessions
-     - Progress text: "12 / 42 sessions completed"
+     - Month progress: "Month 1 of 3 planned" in text-sm text-slate-500
+     - Progress bar showing (completed + completed_mvr sessions) / total generated sessions
+     - Progress text: "12 / 26 sessions completed"
      - The progress bar should use teal-500 for the filled portion
 
 3. Empty state:
    - If no plans exist, show a friendly message: "No plans yet. Let's create one!"
    - Button linking to "/planner"
 
-4. Tapping a plan card navigates to a plan detail view showing ALL sessions for that plan in a list, with their dates, topics, and statuses. Use the same Routine Card design but in a compact version.
+4. Tapping a plan card navigates to "/plans/:id" (the Plan Detail view).
+```
+
+### Prompt 7.2 -- Plan Detail Page with "Plan Next Month"
+
+```
+Create a Plan Detail page at route "/plans/:id".
+
+Layout:
+1. HEADER:
+   - Back arrow to "/plans"
+   - Plan title in text-xl font-bold
+   - Subtitle: plan.prompt_used in text-sm text-slate-400 (truncated to 1 line)
+
+2. MILESTONE TIMELINE (vertical list of monthly milestones):
+   Fetch all milestones for this plan, ordered by month_number.
+   Each milestone renders as a card (bg-white rounded-2xl shadow-sm p-4 mb-4):
+
+   - Top row: "Month [N]" label + status badge on the right:
+     - If is_planned = true: "Active" badge in bg-teal-100 text-teal-700 rounded-full px-3 py-1
+     - If is_planned = false AND it's the next unplanned month: "Ready to plan" badge in bg-indigo-100 text-indigo-700
+     - If is_planned = false AND it's a later month: "Upcoming" badge in bg-slate-100 text-slate-500
+   - Title: milestone.title in font-bold text-slate-800
+   - Description: milestone.description in text-sm text-slate-500
+   - Weekly themes: Show the 4 weekly_themes as a bulleted list in text-xs text-slate-400
+
+   - If is_planned = true:
+     - Show session stats below: "22 / 26 sessions completed" with a thin teal progress bar
+     - Expandable section: tap to show all sessions for this milestone as compact Routine Cards, grouped by week
+
+   - If is_planned = false AND it's the next unplanned month:
+     - Show a prominent "Plan Next Month" button:
+       - Style: bg-teal-500 text-white rounded-2xl py-3 w-full font-bold text-center
+       - Icon: Sparkles from lucide-react
+       - Text: "Plan Month [N]: [milestone.title]"
+     - When tapped:
+       1. Show loading state on the button: spinner + "Generating your sessions..."
+       2. Call the Supabase Edge Function "generate-month" with { plan_id, milestone_id }
+       3. On success: refresh the page, milestone flips to "Active", sessions appear
+       4. Show a toast: "Month [N] is ready! Check your timeline."
+
+3. BOTTOM AREA:
+   - If all months are planned: show a congratulatory message "Full plan generated!"
+   - If not: subtle text "Next month unlocks as you progress"
 ```
 
 ---
@@ -454,8 +572,12 @@ Configure this app as a Progressive Web App:
 Help me test the app by:
 
 1. Creating a seed function (or SQL script) that inserts test data for a logged-in user:
-   - 1 plan called "LeetCode Mastery" with prompt "LeetCode 30 mins daily at 5 PM for 1 month"
-   - 7 sessions for this week, each at 5:00 PM, with these topics and statuses:
+   - 1 plan called "LeetCode Mastery" with prompt "LeetCode 30 mins daily at 5 PM except Sundays for 3 months", total_months=3, months_planned=1
+   - 3 milestones:
+     - Month 1: "Foundation: Arrays & Strings" (is_planned=true), weekly_themes: ["Array basics", "String manipulation", "Hash maps", "Review"]
+     - Month 2: "Intermediate: Trees & Graphs" (is_planned=false), weekly_themes: ["Binary trees", "BST operations", "Graph traversal", "Shortest paths"]
+     - Month 3: "Advanced: Dynamic Programming" (is_planned=false), weekly_themes: ["1D DP", "2D DP", "Optimization", "Contest prep"]
+   - 7 sessions for this week (linked to Month 1 milestone), each at 5:00 PM, with these topics and statuses:
      - Monday: "Arrays: Two Sum & Contains Duplicate" (completed)
      - Tuesday: "Two Pointers: Valid Palindrome" (completed_mvr)
      - Wednesday: "Sliding Window: Max Subarray" (reshuffled, moved to Thursday 7 PM)
@@ -466,7 +588,10 @@ Help me test the app by:
 
 2. Set the user's resilience_score to 42
 
-This will let me verify the dashboard timeline, status colors, and all interactions work correctly.
+This will let me verify:
+- Dashboard timeline with status colors and interactions
+- Plan Detail page with milestones (1 active, 2 upcoming)
+- "Plan Next Month" button appearing on the Month 2 milestone
 ```
 
 ---
@@ -477,11 +602,11 @@ This will let me verify the dashboard timeline, status colors, and all interacti
 |---|---|---|
 | 1 | Design system | Consistent visual language |
 | 2 | Dashboard + Routine Cards | Main screen with timeline UI |
-| 3 | Supabase tables + Auth + data binding | Real backend, login flow |
+| 3 | Supabase tables + Auth + data binding | Real backend (4 tables), login flow |
 | 4 | Complete + Life Happened logic | Core interaction loop works |
 | 5 | Salvage the Day FAB | End-of-day rescue feature |
-| 6 | AI Planner + Edge Function | Users can generate plans via AI |
-| 7 | Plans library | Users can browse and track plans |
+| 6 | AI Planner (two-tier) + 2 Edge Functions | High-level plan + monthly breakdown generation |
+| 7 | Plans library + Plan Detail + "Plan Next Month" | Browse plans, generate sessions month by month |
 | 8 | Animations, swipes, PWA | Polish and native-app feel |
 | 9 | Seed data + QA | End-to-end verification |
 
