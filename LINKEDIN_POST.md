@@ -1,4 +1,4 @@
-Most productivity apps punish you for being human. Miss a day? Streak broken. Skip a workout? Red warning. I built something different.
+Every January, millions of people set goals they genuinely care about -- learn a language, get fit, master a new skill. By February, most have quietly abandoned them. Not because they lacked motivation, but because one missed day turned into two, the streak broke, guilt crept in, and suddenly the whole plan felt impossible to restart. The problem was never willpower. It was that no tool knew how to handle the moment life got in the way. So I built one.
 
 Adaptive Routines is an AI-powered app where you describe a goal in plain language -- "I want to practice LeetCode for 30 minutes every day at 5 PM for 3 months" -- and the AI doesn't just give you a wall of text. It generates a full syllabus of progressive, contextual sessions and drops them straight into your calendar. Day 1: Arrays. Day 2: Two Pointers. Each one with a specific topic and a 5-minute "Minimum Viable Routine" for the days when life gets in the way. Because it will.
 
