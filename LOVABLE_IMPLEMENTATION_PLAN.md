@@ -286,7 +286,7 @@ When the user types a message and hits send:
 - Show a typing indicator (three animated dots in an AI bubble)
 - Call a Supabase Edge Function that:
   a. Receives the user's prompt
-  b. Sends it to the Google Gemini API (model: gemini-2.0-flash) with this prompt:
+  b. Sends it to the Google Gemini API (model: gemini-3.1-pro) with this prompt:
 
 PROMPT (sent as the user message, since Gemini doesn't have a separate system role in the REST API):
 "You are an expert habit coach and schedule planner. The user will describe a goal, preferred schedule, and duration. Return a JSON object with this structure:
@@ -335,7 +335,7 @@ Create a Supabase Edge Function called "generate-plan" that:
 2. Validates the user is authenticated (check the Authorization header JWT)
 3. Calls the Google Gemini API using a direct REST call (no SDK needed in Deno):
 
-   URL: https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}
+   URL: https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro:generateContent?key=${GEMINI_API_KEY}
    Method: POST
    Headers: { "Content-Type": "application/json" }
    Body: {

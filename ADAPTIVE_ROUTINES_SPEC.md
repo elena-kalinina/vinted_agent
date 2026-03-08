@@ -16,7 +16,7 @@ A mobile-first Progressive Web App (PWA) that converts natural-language goals in
 | UI Components | shadcn/ui (ships with Lovable) |
 | Icons | lucide-react (stroke-width 1.5) |
 | Backend / Auth | Supabase (Postgres, Auth, Row-Level Security) |
-| AI Integration | Google Gemini API (gemini-2.0-flash) with JSON mode |
+| AI Integration | Google Gemini API (gemini-3.1-pro) with JSON mode |
 | Deployment | Lovable hosting (Netlify under the hood), PWA-enabled |
 
 ---
@@ -269,7 +269,7 @@ After 6 PM (configurable), if any sessions have status = 'pending':
 ### 7.1 API Configuration
 
 - **Provider:** Google Gemini
-- **Model:** `gemini-2.0-flash` (fast, cheap, strong at structured output)
+- **Model:** `gemini-3.1-pro` (latest frontier model, best reasoning and structured output quality)
 - **Response format:** JSON mode enabled via `responseMimeType: "application/json"` in generation config
 - **API key:** Stored as Supabase Edge Function secret named `GEMINI_API_KEY` (never exposed client-side)
 
@@ -313,7 +313,7 @@ Client (React) -> Supabase Edge Function -> Gemini API -> Parse JSON -> Insert i
 The Edge Function calls the Gemini REST API directly (no SDK needed in Deno):
 
 ```
-POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=GEMINI_API_KEY
+POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro:generateContent?key=GEMINI_API_KEY
 
 Body:
 {
